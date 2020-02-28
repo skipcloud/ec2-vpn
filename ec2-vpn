@@ -1,0 +1,152 @@
+#!/bin/sh -
+export AWS_PROFILE=VPN
+dir=$(dirname $(readlink $0))
+instance_info=$dir/.instance_info
+ovpn_template=$dir/.template.ovpn
+ovpn_output=$dir/.client.ovpn
+
+trap cleanup SIGHUP SIGINT SIGQUIT SIGABRT
+
+die() {
+  printf "error: $1" >&2
+  exit 1
+}
+
+cleanup() {
+  printf "Stopping EC2 instance..."
+  change_ecs_state "stop-instances"
+  printf "done!\n"
+
+  rm "$ovpn_output"
+  exit 1
+}
+
+describe_instance() {
+  resp=$(aws ec2 describe-instances)
+  if [ $? != 0 ]; then
+    die "problem fetching instance information from AWS\n"
+  fi
+  echo $resp | jq '.Reservations[0].Instances[0]' 
+}
+
+fetch_instance_info() {
+  echo $(describe_instance) > $instance_info
+}
+
+wait_for_state() {
+  while [ ! $(describe_instance | jq '.State.Name' | grep -iF $1) ]; do
+    printf "."
+    sleep 0.5
+  done
+  fetch_instance_info
+}
+
+change_ecs_state() {
+  id=$(read_instance_id)
+
+  aws ec2 $1 --instance-ids $id > /dev/null
+  if [ $? != 0 ]; then
+    # aws will tell us if there is a problem
+    case "$1" in
+      *stop* )
+        die "problem stopping EC2 instance\n"
+        ;;
+      *start* )
+        die "problem starting EC2 instance\n"
+        ;;
+    esac
+  fi
+}
+
+update_ovpn_file() {
+  if [ ! -s $ovpn_template ]; then
+    die "ovpn template missing\n"
+  fi
+  cat $ovpn_template | sed -e "s/REMOTE_IP/$1/" > $ovpn_output
+}
+
+start() {
+  if [ ! -s $instance_info ]; then
+    # get info on stopped instance
+    printf 'fetching instance information...'
+    fetch_instance_info
+    printf "done!\n"
+  fi
+
+  # start that instance and wait...
+  printf "starting instance $(read_instance_id)..."
+  change_ecs_state 'start-instances'
+  wait_for_state 'running'
+  printf "done!\n"
+
+  # get updated info which includes public IP
+  fetch_instance_info
+  # generate ovpn file with IP
+  update_ovpn_file $(read_instance_ip)
+}
+
+stop() {
+  # if [ "$(read_instance_state)" = 'stopped' ]; then
+  #   return
+  # fi
+  printf "stopping instance $(read_instance_id)..."
+  change_ecs_state 'stop-instances'
+  wait_for_state 'stopped'
+  printf "done!\n"
+}
+
+update() {
+  printf 'pulling latest information on EC2 instance...'
+  fetch_instance_info
+  printf "done!\n"
+}
+
+read_instance() {
+  if [ ! -s $instance_info ]; then
+    die "no instance information file\nrun \`$(basename $0) update\`\n"
+  fi
+  echo $(cat $instance_info | jq "$1" | sed 's/"//g')
+}
+
+read_instance_id() {
+  read_instance '.InstanceId'
+}
+
+read_instance_ip() {
+  read_instance '.PublicIpAddress'
+}
+
+read_instance_state() {
+  read_instance '.State.Name'
+}
+
+case "$1" in
+  start )
+    # start up the EC2 instance
+    # pull down latest information including IP
+    # generate ovpn file to use
+    start
+    ;;
+  stop )
+    # stop EC2 instance
+    # remove ovpn file
+    stop
+    ;;
+  connect )
+    start
+    sudo openvpn $ovpn_output
+    ;;
+  update )
+    # pull latest information on EC2 instance
+    update
+    ;;
+  ip )
+    read_instance_ip
+    ;;
+  id )
+    read_instance_id
+    ;;
+  state )
+    read_instance_state
+    ;;
+esac
