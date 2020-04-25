@@ -1,152 +1,241 @@
 #!/bin/sh -
-export AWS_PROFILE=VPN
-dir=$(dirname $(readlink $0))
-instance_info=$dir/.instance_info
-ovpn_template=$dir/.template.ovpn
-ovpn_output=$dir/.client.ovpn
 
+# This script is essentially a wrapper around the AWS CLI for starting
+# and stopping an EC2 instance and allow the user to connect to the VPN.
+# Please be sure to read the README for set up as there are a few things
+# that need to be in place for the script to work correctly
+
+# This is the profile used with the AWS CLI.
+export AWS_PROFILE=VPN
+
+# dir is the directory the script lives
+dir=$(dirname $(readlink $0))
+# instance_info is the file that contains the instance information
+instance_info=$dir/.instance_info
+# ovpn is the template used to create a ovpn file with actual remote IP
+ovpn_template=$dir/.template.ovpn
+# ovpn_output is the file with a remote IP used by OpenVPN to connect
+# to the running EC2 instance
+ovpn_output=$dir/.client.ovpn
+# script_name is the name of this script
+script_name=$(basename $0)
+
+# If script is stopped make sure we tidy up after
+# ourselves and leave the place in a good state
 trap cleanup SIGHUP SIGINT SIGQUIT SIGABRT
 
 die() {
-  printf "error: $1" >&2
+  printf "error: $1\n" >&2
   exit 1
 }
 
+# cleanup stops the EC2 instance and removes ovpn file
 cleanup() {
   printf "Stopping EC2 instance..."
   change_ecs_state "stop-instances"
-  printf "done!\n"
+  wait_for_state 'stopped'
+  [ $? = 0 ] && printf "done!\n"
 
   rm "$ovpn_output"
   exit 1
 }
 
+# describe_instance is a wrapper around the 'aws ec2 describe-instances'
+# command, it returns the JSON representation of an instance
 describe_instance() {
-  resp=$(aws ec2 describe-instances)
-  if [ $? != 0 ]; then
-    die "problem fetching instance information from AWS\n"
+  cmd="aws ec2 describe-instances --instance-ids"
+
+  # if argument isn't passed then pull ID from info file
+  # otherwise fetch information for the provided ID
+  if [ -z "$1" ]; then
+    cmd="$cmd $(read_instance_id)"
+  else
+    cmd="$cmd $1"
   fi
-  echo $resp | jq '.Reservations[0].Instances[0]' 
+
+  resp=$(eval $cmd 2>&1)
+  if [ $? != 0 ]; then
+    die "problem fetching instance information from AWS\n$resp"
+  fi
+  echo $resp | jq '.Reservations[0].Instances[0]'
 }
 
+# fetch_instance_info fetches information for an instance
+# and stores the resulting information in a file for later
 fetch_instance_info() {
-  echo $(describe_instance) > $instance_info
+  describe_instance $1 > $instance_info
 }
 
+# wait_for_state waits for a certain provided EC2 state, i.e. running.
+# Then fetches up to date information for the instance
 wait_for_state() {
   while [ ! $(describe_instance | jq '.State.Name' | grep -iF $1) ]; do
-    printf "."
-    sleep 0.5
+    for i in $(seq 3); do
+      printf "."
+      sleep 1
+    done
   done
   fetch_instance_info
 }
 
+# change_ecs_state changes the state of the EC2 instance to
+# either running or stopped.
 change_ecs_state() {
   id=$(read_instance_id)
 
-  aws ec2 $1 --instance-ids $id > /dev/null
+  resp="$(aws ec2 $1 --instance-ids $id)"
   if [ $? != 0 ]; then
     # aws will tell us if there is a problem
     case "$1" in
       *stop* )
-        die "problem stopping EC2 instance\n"
+        die "problem stopping EC2 instance\n$resp"
         ;;
       *start* )
-        die "problem starting EC2 instance\n"
+        die "problem starting EC2 instance\n$resp"
         ;;
     esac
   fi
 }
 
+# update_ovpn_file substitutes the REMOTE_IP string in the
+# ovpn template with the EC2 instance IP and saves it in
+# a new file, this file is then used when connecting to
+# the VPN
 update_ovpn_file() {
   if [ ! -s $ovpn_template ]; then
-    die "ovpn template missing\n"
+    die "ovpn template missing"
   fi
   cat $ovpn_template | sed -e "s/REMOTE_IP/$1/" > $ovpn_output
 }
 
+# start will start the instance if it isn't already running
 start() {
-  if [ ! -s $instance_info ]; then
-    # get info on stopped instance
-    printf 'fetching instance information...'
-    fetch_instance_info
-    printf "done!\n"
+  # first off fetch up to date information on the instance
+  printf 'fetching instance information...'
+  fetch_instance_info
+  [ $? = 0 ] && printf "done!\n"
+
+  if [ "$(read_instance_state)" = 'stopped' ]; then
+    # start that instance and wait...
+    printf "starting instance $(read_instance_id)..."
+    change_ecs_state 'start-instances'
+    wait_for_state 'running'
+    [ $? = 0 ] && printf "done!\n"
+  else
+    echo "instance is currently $(read_instance_state)"
   fi
 
-  # start that instance and wait...
-  printf "starting instance $(read_instance_id)..."
-  change_ecs_state 'start-instances'
-  wait_for_state 'running'
-  printf "done!\n"
-
-  # get updated info which includes public IP
-  fetch_instance_info
   # generate ovpn file with IP
   update_ovpn_file $(read_instance_ip)
 }
 
+# stop will stop the instance provided it isn't already stopped
 stop() {
-  # if [ "$(read_instance_state)" = 'stopped' ]; then
-  #   return
-  # fi
+  if [ "$(read_instance_state)" = 'stopped' ]; then
+    echo "instance not running"
+    return
+  fi
   printf "stopping instance $(read_instance_id)..."
   change_ecs_state 'stop-instances'
   wait_for_state 'stopped'
-  printf "done!\n"
+  [ $? = 0 ] && printf "done!\n"
 }
 
+# update will fetch up to date information for an instance, either
+# using a provided ID or by using the instance info file
 update() {
+  # if the instance_info file doesn't exist and we have no
+  # argument then die. We need an instance ID.
+  if [ ! -e $instance_info ] && [ -z "$1" ]; then
+    die "no instance ID found\nrun '$script_name update <instance-id>'"
+  fi
+
   printf 'pulling latest information on EC2 instance...'
-  fetch_instance_info
-  printf "done!\n"
+  fetch_instance_info $1
+  [ $? = 0 ] && printf "done!\n"
 }
 
-read_instance() {
-  if [ ! -s $instance_info ]; then
-    die "no instance information file\nrun \`$(basename $0) update\`\n"
+# check_instance_info_present checks if the file containing
+# the instance information is present
+check_instance_info_present() {
+  if [ ! -e $instance_info ]; then
+    die "no instance information\nrun \'$script_name update <instance-id>\'"
   fi
+}
+
+# read_instance takes a string argument for jq and reads
+# the instance information file
+read_instance() {
   echo $(cat $instance_info | jq "$1" | sed 's/"//g')
 }
 
+# read_instance_id reads the instance ID from the instance info
 read_instance_id() {
   read_instance '.InstanceId'
 }
 
+# read_instance_ip reads the instance IP from the instance info
 read_instance_ip() {
   read_instance '.PublicIpAddress'
 }
 
+# read_instance_state reads the instance state from the instance info
 read_instance_state() {
   read_instance '.State.Name'
 }
 
+# help prints out script usage
+help() {
+  echo "$script_name start | stop | connect | update [<instance-id>] | id | ip | state"
+}
+
+# check for prerequisites
+! type aws > /dev/null && die "AWS CLI not installed"
+! type openvpn > /dev/null  && die "OpenVPN not installed"
+! type jq > /dev/null && die "jq not installed"
+
 case "$1" in
+  help )
+    help
+    ;;
   start )
+    check_instance_info_present
     # start up the EC2 instance
     # pull down latest information including IP
     # generate ovpn file to use
     start
     ;;
   stop )
+    check_instance_info_present
     # stop EC2 instance
     # remove ovpn file
     stop
     ;;
   connect )
+    # start up EC2 instance
+    # pull latest information on instance
+    # connect to the VPN
+    check_instance_info_present
     start
     sudo openvpn $ovpn_output
     ;;
   update )
     # pull latest information on EC2 instance
-    update
+    update $2
     ;;
   ip )
+    # print the IP of the instance
+    check_instance_info_present
     read_instance_ip
     ;;
   id )
+    # print the ID of the instance
+    check_instance_info_present
     read_instance_id
     ;;
   state )
+    # print the state of the instance
+    check_instance_info_present
     read_instance_state
     ;;
 esac
