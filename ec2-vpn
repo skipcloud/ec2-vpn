@@ -6,7 +6,7 @@
 # that need to be in place for the script to work correctly
 
 # This is the profile used with the AWS CLI.
-export AWS_PROFILE=VPN
+export AWS_PROFILE=${AWS_VPN_PROFILE:-VPN}
 
 # dir is the directory the script lives
 dir=$(dirname $(readlink $0))
